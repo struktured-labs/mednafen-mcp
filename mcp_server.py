@@ -12,10 +12,21 @@ import subprocess
 import re
 import os
 import struct
+import time
+import signal
 from typing import Any
 
 # MCP Protocol version
 PROTOCOL_VERSION = "2024-11-05"
+
+# Default ROM paths to search for Dr. Mario
+DEFAULT_ROM_PATHS = [
+    "/home/struktured/gaming/roms/NES/USA/drmario_vs_cpu.nes",
+    "/home/struktured/gaming/roms/NES/USA/Dr. Mario (USA).nes",
+    "/home/struktured/gaming/roms/NES/USA/drmario.nes",
+    "drmario_vs_cpu.nes",
+    "drmario.nes",
+]
 
 # Mednafen NES RAM typically mapped in the process memory
 # We'll need to find the actual address dynamically
@@ -177,6 +188,132 @@ class MednafenMCP:
         self.nes_ram_base: int | None = None  # Base address of NES RAM in process
         self._last_validate_frame: int = 0    # For RAM validation
         self._validation_failures: int = 0    # Track consecutive failures
+        self._mednafen_process: subprocess.Popen | None = None  # Managed process
+
+    def _find_rom(self, rom_path: str | None = None) -> str | None:
+        """Find a Dr. Mario ROM file."""
+        if rom_path and os.path.exists(rom_path):
+            return rom_path
+
+        for path in DEFAULT_ROM_PATHS:
+            if os.path.exists(path):
+                return path
+        return None
+
+    def launch(self, rom_path: str | None = None, headless: bool = True) -> dict:
+        """
+        Launch Mednafen with Dr. Mario ROM.
+
+        Args:
+            rom_path: Path to ROM file (optional, will search default locations)
+            headless: Run without display using SDL dummy drivers
+        """
+        # Check if already running
+        existing_pid = find_mednafen_pid()
+        if existing_pid:
+            self.pid = existing_pid
+            self._discover_nes_ram()
+            return {
+                "success": True,
+                "pid": existing_pid,
+                "message": "Mednafen already running",
+                "launched": False
+            }
+
+        # Find ROM
+        rom = self._find_rom(rom_path)
+        if not rom:
+            return {
+                "error": f"ROM not found. Searched: {DEFAULT_ROM_PATHS}",
+                "hint": "Provide rom_path parameter or place ROM in default location"
+            }
+
+        # Build command
+        env = os.environ.copy()
+        if headless:
+            env["SDL_VIDEODRIVER"] = "dummy"
+            env["SDL_AUDIODRIVER"] = "dummy"
+
+        cmd = ["mednafen", rom]
+
+        try:
+            # Launch Mednafen
+            self._mednafen_process = subprocess.Popen(
+                cmd,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True  # Don't kill when parent exits
+            )
+
+            # Wait for process to start
+            time.sleep(1.0)
+
+            # Verify it's running
+            if self._mednafen_process.poll() is not None:
+                return {
+                    "error": "Mednafen failed to start",
+                    "returncode": self._mednafen_process.returncode
+                }
+
+            self.pid = self._mednafen_process.pid
+
+            # Wait a bit more for game to initialize, then discover RAM
+            time.sleep(1.0)
+            self._discover_nes_ram()
+
+            return {
+                "success": True,
+                "pid": self.pid,
+                "rom": rom,
+                "headless": headless,
+                "nes_ram_base": hex(self.nes_ram_base) if self.nes_ram_base else None,
+                "message": f"Launched Mednafen {'(headless)' if headless else ''} with {os.path.basename(rom)}",
+                "launched": True
+            }
+
+        except FileNotFoundError:
+            return {"error": "Mednafen not found in PATH"}
+        except Exception as e:
+            return {"error": f"Failed to launch: {str(e)}"}
+
+    def shutdown(self) -> dict:
+        """Shutdown the managed Mednafen process."""
+        if self._mednafen_process is None:
+            # Try to find and kill any running Mednafen
+            pid = find_mednafen_pid()
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    time.sleep(0.5)
+                    # Check if still running
+                    try:
+                        os.kill(pid, 0)
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    self.pid = None
+                    self.nes_ram_base = None
+                    return {"success": True, "message": f"Terminated Mednafen (PID {pid})"}
+                except Exception as e:
+                    return {"error": f"Failed to terminate: {str(e)}"}
+            return {"error": "No Mednafen process to shutdown"}
+
+        try:
+            self._mednafen_process.terminate()
+            try:
+                self._mednafen_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._mednafen_process.kill()
+                self._mednafen_process.wait()
+
+            pid = self._mednafen_process.pid
+            self._mednafen_process = None
+            self.pid = None
+            self.nes_ram_base = None
+            return {"success": True, "message": f"Shutdown Mednafen (PID {pid})"}
+        except Exception as e:
+            return {"error": f"Failed to shutdown: {str(e)}"}
 
     def _is_process_alive(self) -> bool:
         """Check if the connected process is still running."""
@@ -554,6 +691,32 @@ def handle_tools_list(params: dict) -> dict:
     return {
         "tools": [
             {
+                "name": "launch",
+                "description": "Launch Mednafen with Dr. Mario ROM (headless by default)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "rom_path": {
+                            "type": "string",
+                            "description": "Path to ROM file (optional, searches default locations)"
+                        },
+                        "headless": {
+                            "type": "boolean",
+                            "description": "Run without display (default: true)",
+                            "default": True
+                        }
+                    }
+                }
+            },
+            {
+                "name": "shutdown",
+                "description": "Shutdown Mednafen process",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
                 "name": "connect",
                 "description": "Connect to running Mednafen process and auto-discover NES RAM",
                 "inputSchema": {
@@ -647,7 +810,14 @@ mcp = MednafenMCP()
 
 def handle_tool_call(name: str, arguments: dict) -> dict:
     """Handle a tool call."""
-    if name == "connect":
+    if name == "launch":
+        return mcp.launch(
+            arguments.get("rom_path"),
+            arguments.get("headless", True)
+        )
+    elif name == "shutdown":
+        return mcp.shutdown()
+    elif name == "connect":
         return mcp.connect()
     elif name == "read_memory":
         return mcp.read_nes_ram(
