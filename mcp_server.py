@@ -119,32 +119,138 @@ def get_all_memory_regions(pid: int) -> list[tuple[int, int, str, str]]:
 class MednafenMCP:
     """MCP Server for Mednafen."""
 
-    # Dr. Mario memory addresses
-    ADDR_LEFT_COLOR = 0x0381      # Current capsule left color (0-2)
-    ADDR_RIGHT_COLOR = 0x0382     # Current capsule right color (0-2)
-    ADDR_X_POS = 0x0385           # Current capsule X position
-    ADDR_Y_POS = 0x0386           # Current capsule Y position
-    ADDR_P1_VIRUSES = 0x0324      # Player 1 virus count
-    ADDR_P2_VIRUSES = 0x03A4      # Player 2 virus count
-    ADDR_P1_PLAYFIELD = 0x0400    # Player 1 playfield (128 bytes)
-    ADDR_P2_PLAYFIELD = 0x0500    # Player 2 playfield (128 bytes)
-    ADDR_GAME_MODE = 0x0046       # Game mode/state
-    ADDR_FRAME_COUNTER = 0x0043   # Frame counter
+    # ==========================================================================
+    # Dr. Mario Memory Map (from Data Crystal wiki)
+    # Source: https://datacrystal.tcrf.net/wiki/Dr._Mario_(NES)/RAM_map
+    # ==========================================================================
 
-    # Virus tile values
-    VIRUS_YELLOW = 0xD0
-    VIRUS_RED = 0xD1
-    VIRUS_BLUE = 0xD2
+    # System/Global
+    ADDR_FRAME_COUNTER = 0x0043   # Frame counter (0-255, wraps)
+    ADDR_GAME_MODE = 0x0046       # Game mode/state
+    ADDR_SPEED_CURSOR = 0x008B    # Speed setting cursor position
+    ADDR_VIRUS_LEVEL = 0x0096     # Virus level setting
+    ADDR_CAPSULE_ORIENT = 0x00A5  # Capsule orientation (0=horiz, 1=vert CCW, 2=reverse, 3=vert CW)
+
+    # Player 1 Capsule State (base $0300)
+    ADDR_P1_LEFT_COLOR = 0x0301   # P1 falling capsule left color (0=Yellow, 1=Red, 2=Blue)
+    ADDR_P1_RIGHT_COLOR = 0x0302  # P1 falling capsule right color
+    ADDR_P1_X_POS = 0x0305        # P1 falling capsule X position (0-7)
+    ADDR_P1_Y_POS = 0x0306        # P1 falling capsule Y position (0-15)
+    ADDR_P1_DROP_TIMER = 0x0312   # Frames remaining before P1 pill drops
+    ADDR_P1_LEVEL = 0x0316        # P1 level number (0-20)
+    ADDR_P1_SPEED = 0x030B        # P1 pill speed (0x26=fastest, 0x85=slowest)
+    ADDR_P1_VIRUSES = 0x0324      # P1 virus count remaining (decimal)
+
+    # Player 2 Capsule State (base $0380, offset +0x80 from P1)
+    ADDR_P2_LEFT_COLOR = 0x0381   # P2 falling capsule left color
+    ADDR_P2_RIGHT_COLOR = 0x0382  # P2 falling capsule right color
+    ADDR_P2_X_POS = 0x0385        # P2 falling capsule X position
+    ADDR_P2_Y_POS = 0x0386        # P2 falling capsule Y position
+    ADDR_P2_DROP_TIMER = 0x0392   # Frames remaining before P2 pill drops
+    ADDR_P2_LEVEL = 0x0396        # P2 level number
+    ADDR_P2_SPEED = 0x038B        # P2 pill speed
+    ADDR_P2_VIRUSES = 0x03A4      # P2 virus count remaining
+
+    # Playfields (8 columns x 16 rows = 128 bytes each)
+    ADDR_P1_PLAYFIELD = 0x0400    # P1 playfield tiles (top-left to bottom-right)
+    ADDR_P2_PLAYFIELD = 0x0500    # P2 playfield tiles
+
+    # Game Settings
+    ADDR_NUM_PLAYERS = 0x0727     # Number of players (1 or 2)
+    ADDR_FLOAT_PILLS = 0x0724     # Non-zero = pills float (don't fall after matches)
+    ADDR_WINS_NEEDED = 0x0725     # Games needed to win in 2P mode
+    ADDR_ANTI_PIRACY = 0x0740     # Anti-piracy flag (0x00=OK, 0xFF=failed)
+
+    # Tile Values
+    TILE_EMPTY = 0xFF             # Empty cell
+    TILE_VIRUS_YELLOW = 0xD0      # Yellow virus
+    TILE_VIRUS_RED = 0xD1         # Red virus
+    TILE_VIRUS_BLUE = 0xD2        # Blue virus
+    # Capsule half tiles: 0x4C-0x5B (various colors/orientations)
+
+    # Color names for display
+    COLOR_NAMES = ["Yellow", "Red", "Blue"]
+    ORIENTATION_NAMES = ["Horizontal", "Vertical CCW", "Reverse", "Vertical CW"]
 
     def __init__(self):
         self.pid: int | None = None
         self.nes_ram_base: int | None = None  # Base address of NES RAM in process
+        self._last_validate_frame: int = 0    # For RAM validation
+        self._validation_failures: int = 0    # Track consecutive failures
+
+    def _is_process_alive(self) -> bool:
+        """Check if the connected process is still running."""
+        if self.pid is None:
+            return False
+        try:
+            # Check if process exists
+            with open(f'/proc/{self.pid}/stat', 'r'):
+                return True
+        except (FileNotFoundError, PermissionError):
+            return False
+
+    def _validate_ram(self) -> bool:
+        """
+        Validate that our NES RAM base is still correct.
+        Returns True if valid, False if needs rediscovery.
+        """
+        if self.pid is None or self.nes_ram_base is None:
+            return False
+
+        if not self._is_process_alive():
+            self.pid = None
+            self.nes_ram_base = None
+            return False
+
+        # Read a small sample and check it looks like valid Dr. Mario RAM
+        data = read_process_memory(self.pid, self.nes_ram_base, 0x400)
+        if data is None:
+            self._validation_failures += 1
+            if self._validation_failures > 3:
+                self.nes_ram_base = None
+            return False
+
+        # Check that color values at known addresses are valid (0-2)
+        p1_left = data[self.ADDR_P1_LEFT_COLOR]
+        p1_right = data[self.ADDR_P1_RIGHT_COLOR]
+        p2_left = data[self.ADDR_P2_LEFT_COLOR]
+        p2_right = data[self.ADDR_P2_RIGHT_COLOR]
+
+        # At least one player should have valid colors
+        p1_valid = p1_left <= 2 and p1_right <= 2
+        p2_valid = p2_left <= 2 and p2_right <= 2
+
+        if p1_valid or p2_valid:
+            self._validation_failures = 0
+            return True
+        else:
+            self._validation_failures += 1
+            if self._validation_failures > 5:
+                # RAM location might have changed, need rediscovery
+                self.nes_ram_base = None
+            return False
 
     def connect(self) -> dict:
         """Connect to Mednafen process."""
+        # Check if already connected to a valid process
+        if self.pid is not None and self._is_process_alive():
+            if self._validate_ram():
+                return {
+                    "success": True,
+                    "pid": self.pid,
+                    "nes_ram_base": hex(self.nes_ram_base) if self.nes_ram_base else None,
+                    "message": f"Already connected to Mednafen (PID {self.pid})",
+                    "reconnected": False
+                }
+
+        # Find Mednafen process
         self.pid = find_mednafen_pid()
         if self.pid is None:
+            self.nes_ram_base = None
             return {"error": "Mednafen not running"}
+
+        # Reset validation state
+        self._validation_failures = 0
 
         # Try to auto-discover NES RAM
         ram_result = self._discover_nes_ram()
@@ -154,8 +260,22 @@ class MednafenMCP:
             "pid": self.pid,
             "nes_ram_base": hex(self.nes_ram_base) if self.nes_ram_base else None,
             "message": f"Connected to Mednafen (PID {self.pid})" +
-                      (f", NES RAM at {self.nes_ram_base:016x}" if self.nes_ram_base else ", NES RAM not found yet")
+                      (f", NES RAM at {self.nes_ram_base:016x}" if self.nes_ram_base else ", NES RAM not found yet"),
+            "reconnected": True
         }
+
+    def ensure_connected(self) -> dict | None:
+        """Ensure we're connected, reconnect if needed. Returns error dict or None."""
+        if self.pid is None or not self._is_process_alive():
+            result = self.connect()
+            if "error" in result:
+                return result
+        if not self._validate_ram():
+            # Try rediscovery
+            self._discover_nes_ram()
+            if self.nes_ram_base is None:
+                return {"error": "NES RAM not found. Is a game running?"}
+        return None
 
     def _discover_nes_ram(self) -> dict:
         """
@@ -224,14 +344,10 @@ class MednafenMCP:
 
     def read_nes_ram(self, address: int, size: int = 1) -> dict:
         """Read from NES RAM (address $0000-$07FF)."""
-        if self.pid is None:
-            return {"error": "Not connected"}
-
-        if self.nes_ram_base is None:
-            # Try to discover RAM first
-            self._discover_nes_ram()
-            if self.nes_ram_base is None:
-                return {"error": "NES RAM not found. Is a game running?"}
+        # Auto-reconnect if needed
+        error = self.ensure_connected()
+        if error:
+            return error
 
         if address < 0 or address > 0x7FF:
             return {"error": f"Address {address:04X} out of NES RAM range"}
@@ -249,11 +365,10 @@ class MednafenMCP:
 
     def write_nes_ram(self, address: int, data: list[int]) -> dict:
         """Write to NES RAM."""
-        if self.pid is None:
-            return {"error": "Not connected"}
-
-        if self.nes_ram_base is None:
-            return {"error": "NES RAM not found"}
+        # Auto-reconnect if needed
+        error = self.ensure_connected()
+        if error:
+            return error
 
         if address < 0 or address > 0x7FF:
             return {"error": f"Address {address:04X} out of NES RAM range"}
@@ -261,41 +376,141 @@ class MednafenMCP:
         success = write_process_memory(self.pid, self.nes_ram_base + address, bytes(data))
         return {"success": success}
 
+    def _parse_playfield(self, data: bytes, player: int = 2) -> dict:
+        """Parse playfield data into structured format."""
+        offset = self.ADDR_P1_PLAYFIELD if player == 1 else self.ADDR_P2_PLAYFIELD
+        playfield = data[offset:offset + 128]
+
+        viruses = []
+        capsules = []
+        for i, tile in enumerate(playfield):
+            col = i % 8
+            row = i // 8
+            if tile in (self.TILE_VIRUS_YELLOW, self.TILE_VIRUS_RED, self.TILE_VIRUS_BLUE):
+                color = {self.TILE_VIRUS_YELLOW: "yellow",
+                        self.TILE_VIRUS_RED: "red",
+                        self.TILE_VIRUS_BLUE: "blue"}[tile]
+                viruses.append({"row": row, "col": col, "color": color, "tile": tile})
+            elif tile != self.TILE_EMPTY and tile != 0x00:
+                # Capsule half or other tile
+                capsules.append({"row": row, "col": col, "tile": tile})
+
+        return {
+            "viruses": viruses,
+            "capsules": capsules,
+            "raw": playfield.hex()
+        }
+
+    def _render_playfield_ascii(self, data: bytes, player: int = 2) -> str:
+        """Render playfield as ASCII art."""
+        offset = self.ADDR_P1_PLAYFIELD if player == 1 else self.ADDR_P2_PLAYFIELD
+        playfield = data[offset:offset + 128]
+
+        # Tile to character mapping
+        tile_chars = {
+            self.TILE_EMPTY: '.',
+            self.TILE_VIRUS_YELLOW: 'Y',
+            self.TILE_VIRUS_RED: 'R',
+            self.TILE_VIRUS_BLUE: 'B',
+            0x00: ' ',  # Sometimes empty is 0
+        }
+
+        lines = [f"  P{player} Playfield", "  +---------+"]
+        for row in range(16):
+            row_tiles = playfield[row * 8:(row + 1) * 8]
+            row_chars = []
+            for tile in row_tiles:
+                if tile in tile_chars:
+                    row_chars.append(tile_chars[tile])
+                elif 0x4C <= tile <= 0x5B:
+                    # Capsule halves - color based on tile
+                    # Yellow: 0x4C-0x4F, Red: 0x50-0x53, Blue: 0x54-0x57 (approx)
+                    if tile < 0x50:
+                        row_chars.append('y')
+                    elif tile < 0x54:
+                        row_chars.append('r')
+                    elif tile < 0x58:
+                        row_chars.append('b')
+                    else:
+                        row_chars.append('c')
+                else:
+                    row_chars.append('?')
+            lines.append(f"{row:2d}|{''.join(row_chars)}|")
+        lines.append("  +---------+")
+        lines.append("   01234567")
+        return '\n'.join(lines)
+
     def get_game_state(self) -> dict:
-        """Get current Dr. Mario game state."""
-        if self.pid is None:
-            return {"error": "Not connected"}
+        """Get comprehensive Dr. Mario game state."""
+        # Auto-reconnect if needed
+        error = self.ensure_connected()
+        if error:
+            return error
 
-        if self.nes_ram_base is None:
-            self._discover_nes_ram()
-            if self.nes_ram_base is None:
-                return {"error": "NES RAM not found"}
+        # Read all NES RAM (2KB)
+        data = read_process_memory(self.pid, self.nes_ram_base, 0x800)
+        if data is None:
+            return {"error": "Failed to read memory"}
 
-        # Read key game state values
+        # Global state
+        frame = data[self.ADDR_FRAME_COUNTER]
+        game_mode = data[self.ADDR_GAME_MODE]
+        orientation = data[self.ADDR_CAPSULE_ORIENT]
+        num_players = data[self.ADDR_NUM_PLAYERS] if self.ADDR_NUM_PLAYERS < len(data) else 0
+
+        # Player 1 state
+        p1 = {
+            "left_color": data[self.ADDR_P1_LEFT_COLOR],
+            "right_color": data[self.ADDR_P1_RIGHT_COLOR],
+            "left_color_name": self.COLOR_NAMES[data[self.ADDR_P1_LEFT_COLOR]] if data[self.ADDR_P1_LEFT_COLOR] < 3 else "?",
+            "right_color_name": self.COLOR_NAMES[data[self.ADDR_P1_RIGHT_COLOR]] if data[self.ADDR_P1_RIGHT_COLOR] < 3 else "?",
+            "x_pos": data[self.ADDR_P1_X_POS],
+            "y_pos": data[self.ADDR_P1_Y_POS],
+            "drop_timer": data[self.ADDR_P1_DROP_TIMER],
+            "level": data[self.ADDR_P1_LEVEL],
+            "speed": data[self.ADDR_P1_SPEED],
+            "virus_count": data[self.ADDR_P1_VIRUSES],
+            "playfield": self._parse_playfield(data, 1)
+        }
+
+        # Player 2 state
+        p2 = {
+            "left_color": data[self.ADDR_P2_LEFT_COLOR],
+            "right_color": data[self.ADDR_P2_RIGHT_COLOR],
+            "left_color_name": self.COLOR_NAMES[data[self.ADDR_P2_LEFT_COLOR]] if data[self.ADDR_P2_LEFT_COLOR] < 3 else "?",
+            "right_color_name": self.COLOR_NAMES[data[self.ADDR_P2_RIGHT_COLOR]] if data[self.ADDR_P2_RIGHT_COLOR] < 3 else "?",
+            "x_pos": data[self.ADDR_P2_X_POS],
+            "y_pos": data[self.ADDR_P2_Y_POS],
+            "drop_timer": data[self.ADDR_P2_DROP_TIMER],
+            "level": data[self.ADDR_P2_LEVEL],
+            "speed": data[self.ADDR_P2_SPEED],
+            "virus_count": data[self.ADDR_P2_VIRUSES],
+            "playfield": self._parse_playfield(data, 2)
+        }
+
+        return {
+            "frame": frame,
+            "game_mode": game_mode,
+            "orientation": orientation,
+            "orientation_name": self.ORIENTATION_NAMES[orientation] if orientation < 4 else "?",
+            "num_players": num_players,
+            "player1": p1,
+            "player2": p2
+        }
+
+    def get_playfield_ascii(self, player: int = 2) -> dict:
+        """Get ASCII art visualization of playfield."""
+        # Auto-reconnect if needed
+        error = self.ensure_connected()
+        if error:
+            return error
+
         data = read_process_memory(self.pid, self.nes_ram_base, 0x600)
         if data is None:
             return {"error": "Failed to read memory"}
 
-        # Parse Dr. Mario specific values
-        p2_playfield = data[0x500:0x580]
-        viruses = []
-        for i, b in enumerate(p2_playfield):
-            if b in (0xD0, 0xD1, 0xD2):
-                col = i % 8
-                row = i // 8
-                color = {0xD0: "yellow", 0xD1: "red", 0xD2: "blue"}[b]
-                viruses.append({"row": row, "col": col, "color": color})
-
-        return {
-            "left_color": data[0x381],
-            "right_color": data[0x382],
-            "x_pos": data[0x385],
-            "y_pos": data[0x386],
-            "p2_virus_count": data[0x3A4],
-            "frame_counter": data[0x43],
-            "viruses": viruses,
-            "playfield_hex": p2_playfield.hex()
-        }
+        ascii_art = self._render_playfield_ascii(data, player)
+        return {"player": player, "playfield": ascii_art}
 
     def find_nes_ram(self) -> dict:
         """
@@ -386,10 +601,24 @@ def handle_tools_list(params: dict) -> dict:
             },
             {
                 "name": "game_state",
-                "description": "Get Dr. Mario game state (capsule colors, position, viruses)",
+                "description": "Get comprehensive Dr. Mario game state for both players",
                 "inputSchema": {
                     "type": "object",
                     "properties": {}
+                }
+            },
+            {
+                "name": "playfield",
+                "description": "Get ASCII art visualization of playfield",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "player": {
+                            "type": "integer",
+                            "description": "Player number (1 or 2)",
+                            "default": 2
+                        }
+                    }
                 }
             },
             {
@@ -432,6 +661,10 @@ def handle_tool_call(name: str, arguments: dict) -> dict:
         )
     elif name == "game_state":
         return mcp.get_game_state()
+    elif name == "playfield":
+        return mcp.get_playfield_ascii(
+            arguments.get("player", 2)
+        )
     elif name == "get_maps":
         return mcp.get_process_maps()
     elif name == "find_ram":
